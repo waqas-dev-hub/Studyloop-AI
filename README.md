@@ -196,18 +196,3 @@ View traces at: [smith.langchain.com](https://smith.langchain.com)
 Full Swagger docs at `http://localhost:8000/docs`
 
 ---
-
-## Resume Bullet Points
-
-> **StudyLoop AI** — Built a truly agentic AI study planner using **LangGraph**, **LangChain**, **Groq**, **MCP**, **FastAPI**, and **Streamlit**
-> - Designed a 7-node LangGraph agent with conditional routing that diagnoses misconceptions, chooses from 8 pedagogical strategies, and self-verifies via a critic loop
-> - Integrated **MCP** (Model Context Protocol) with 8 autonomous tools for quiz generation, grading, plan management, and misconception-targeted teaching
-> - Built human-in-the-loop approval for study plan changes and a spaced-repetition algorithm with mastery tracking
-> - Added **LangSmith** tracing for full observability of agent decision chains and LLM interactions
-> - Deployed as a full-stack app with FastAPI backend, Streamlit dashboard, and SQLite persistence
-
----
-
-## License
-
-MIT
