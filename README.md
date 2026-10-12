@@ -174,7 +174,6 @@ Every agent step is automatically traced in LangSmith:
 - **critic_verify** — Whether the critic passed or failed
 - **update_state** — What was written to the database
 
-View traces at: [smith.langchain.com](https://smith.langchain.com)
 
 ---
 
@@ -193,6 +192,5 @@ View traces at: [smith.langchain.com](https://smith.langchain.com)
 | GET | `/api/subjects/{id}/dashboard` | Full analytics dashboard |
 | POST | `/api/subjects/{id}/mock` | Generate mock paper |
 
-Full Swagger docs at `http://localhost:8000/docs`
 
 ---
