@@ -1,29 +1,21 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 import json
 import os
 from datetime import datetime, date, timedelta
 from typing import Any
-from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 from langsmith import traceable
 from .state import AgentState
+from json_utils import parse_json_response
 from .prompts import DIAGNOSE_PROMPT, CHOOSE_ACTION_PROMPT, GENERATE_QUIZ_PROMPT, GRADE_ANSWER_PROMPT, CREATE_EXPLANATION_PROMPT, WORKED_EXAMPLE_PROMPT, CRITIC_PROMPT, REPLAN_PROMPT, GENERATE_MOCK_PROMPT
 from database import get_db_session, Subject, Topic, Misconception, QuizHistory, StudyPlanEntry, UploadedDocument, PlanStatus, ActionType
-load_dotenv()
-MODEL_NAME = os.getenv('MODEL_NAME', 'meta-llama/llama-4-scout-17b-16e-instruct')
+MODEL_NAME = os.getenv('MODEL_NAME', 'openai/gpt-oss-120b')
 
 def get_llm(temperature: float=0.3) -> ChatGroq:
     return ChatGroq(model=MODEL_NAME, temperature=temperature, max_tokens=4096)
-
-def parse_json_response(text: str) -> Any:
-    text = text.strip()
-    if text.startswith('```json'):
-        text = text[7:]
-    elif text.startswith('```'):
-        text = text[3:]
-    if text.endswith('```'):
-        text = text[:-3]
-    return json.loads(text.strip())
 
 @traceable(name='observe_state', run_type='chain')
 def observe_state(state: AgentState) -> dict:
@@ -72,7 +64,7 @@ def choose_teaching_action(state: AgentState) -> dict:
     try:
         response = llm.invoke([HumanMessage(content=prompt)])
         action = parse_json_response(response.content)
-        return {'chosen_action': action, 'action_reasoning': action.get('reasoning', '')}
+        return {'chosen_action': action, 'action_reasoning': action.get('reasoning', ''), 'retry_count': 0}
     except Exception as e:
         weakest = min(mastery.items(), key=lambda x: x[1].get('score', 0) if isinstance(x[1], dict) else 0, default=('General', {'id': None, 'score': 0}))
         return {'chosen_action': {'action_type': 'quiz', 'topic_id': weakest[1].get('id') if isinstance(weakest[1], dict) else None, 'topic_name': weakest[0], 'difficulty': 'medium', 'reasoning': f'Fallback: quizzing weakest topic due to error: {e}'}, 'action_reasoning': f'Fallback due to error: {e}'}
@@ -167,7 +159,8 @@ def critic_verify(state: AgentState) -> dict:
         prompt = CRITIC_PROMPT.format(content=json.dumps(action_result, indent=2)[:2000], source_notes=source_notes)
         response = llm.invoke([HumanMessage(content=prompt)])
         critic_result = parse_json_response(response.content)
-        return {'critic_passed': critic_result.get('passed', True), 'critic_feedback': critic_result.get('feedback', '')}
+        passed = critic_result.get('passed', True)
+        return {'critic_passed': passed, 'critic_feedback': critic_result.get('feedback', ''), 'retry_count': state.get('retry_count', 0) + (0 if passed else 1)}
     except Exception as e:
         return {'critic_passed': True, 'critic_feedback': f'Verification skipped due to error: {e}'}
     finally:
@@ -233,10 +226,12 @@ def should_continue(state: AgentState) -> str:
         return 'end'
     if state.get('questions_asked', 0) >= 10:
         return 'end'
+    if 'graded' not in state.get('action_result', {}):
+        return 'end'
     return 'continue'
 
 def should_retry(state: AgentState) -> str:
-    if not state.get('critic_passed', True):
+    if not state.get('critic_passed', True) and state.get('retry_count', 0) < 2:
         return 'retry'
     return 'proceed'
 

@@ -4,13 +4,12 @@ import asyncio
 from datetime import datetime, date, timedelta
 from typing import Any
 from dotenv import load_dotenv
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
+from mcp.server.mcpserver import MCPServer
 from langchain_groq import ChatGroq
 from database import get_db_session, Subject, Topic, Misconception, QuizHistory, StudyPlanEntry, UploadedDocument, PlanStatus, ActionType
 load_dotenv()
-server = Server('adaptive-study-planner')
-MODEL_NAME = os.getenv('MODEL_NAME', 'meta-llama/llama-4-scout-17b-16e-instruct')
+server = MCPServer('adaptive-study-planner')
+MODEL_NAME = os.getenv('MODEL_NAME', 'openai/gpt-oss-120b')
 
 def get_llm(temperature: float=0.5) -> ChatGroq:
     api_key = os.getenv('GROQ_API_KEY')
@@ -204,7 +203,6 @@ async def create_explanation(topic_id: int, misconception: str, context: str='')
         db.close()
 
 async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+    await server.run_stdio_async()
 if __name__ == '__main__':
     asyncio.run(main())

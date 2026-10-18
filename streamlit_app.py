@@ -50,7 +50,9 @@ st.sidebar.divider()
 subjects = api_get('/subjects') or []
 if subjects:
     subject_map = {s['id']: s['name'] for s in subjects}
-    selected_id = st.sidebar.selectbox('Current Subject', options=list(subject_map.keys()), format_func=lambda x: subject_map[x], index=0 if not st.session_state.subject_id else list(subject_map.keys()).index(st.session_state.subject_id))
+    _keys = list(subject_map.keys())
+    _default_idx = _keys.index(st.session_state.subject_id) if st.session_state.subject_id in _keys else 0
+    selected_id = st.sidebar.selectbox('Current Subject', options=_keys, format_func=lambda x: subject_map[x], index=_default_idx)
     st.session_state.subject_id = selected_id
 else:
     st.sidebar.write('No subjects yet. Create one in Subjects.')

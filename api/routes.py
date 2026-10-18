@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 import os
 import json
 import uuid
@@ -8,19 +11,21 @@ from sqlalchemy.orm import Session
 from langchain_groq import ChatGroq
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_core.messages import HumanMessage
-from dotenv import load_dotenv
 from database import get_db, Subject, Topic, StudyPlanEntry, UploadedDocument, QuizHistory, Misconception, PlanStatus, ActionType
 from models import SubjectCreate, SubjectResponse, TopicMastery, UploadResponse, SessionStart, SessionResponse, SessionNextAction, QuizAnswerRequest, GradeResult, StudyPlanEntryResponse, PlanApproval, DashboardData, MockPaper, MockPaperResult, AgentAction
-load_dotenv()
+import logging
+from json_utils import parse_json_response
+logger = logging.getLogger(__name__)
 try:
     from agent import create_agent_graph
     agent_graph = create_agent_graph()
 except Exception:
+    logger.exception('Failed to initialise LangGraph agent; continuing without it')
     agent_graph = None
 router = APIRouter()
 active_sessions: dict[int, dict] = {}
 _session_counter = 0
-MODEL_NAME = os.getenv('MODEL_NAME', 'meta-llama/llama-4-scout-17b-16e-instruct')
+MODEL_NAME = os.getenv('MODEL_NAME', 'openai/gpt-oss-120b')
 
 def get_llm(temperature: float=0.3) -> ChatGroq:
     return ChatGroq(model=MODEL_NAME, temperature=temperature, max_tokens=4096)
@@ -103,7 +108,7 @@ async def upload_document(subject_id: int, file: UploadFile=File(...), db: Sessi
             content = content[3:]
         if content.endswith('```'):
             content = content[:-3]
-        topic_names = json.loads(content.strip())
+        topic_names = parse_json_response(content)
         if not isinstance(topic_names, list):
             topic_names = ['General']
     except Exception:
@@ -127,20 +132,61 @@ def start_session(req: SessionStart, db: Session=Depends(get_db)):
         first_action = AgentAction(action_type='quiz', topic_name='General', reasoning='No topics found. Upload study materials first.', content={'message': 'Please upload study materials to get started.'})
     else:
         try:
-            llm = get_llm(temperature=0.5)
-            response = llm.invoke([HumanMessage(content=f"""Generate 1 MCQ question about '{topic.name}'. Context: {(topic.content or '')[:2000]}\n\nReturn ONLY valid JSON:\n{{"question": "...", "options": ["A) ...", "B) ...", "C) ...", "D) ..."], "correct_answer": "exact text of correct option", "explanation": "..."}}""")])
+            llm = get_llm(temperature=0.4)
+            quiz_prompt = (
+                f"Generate 1 multiple-choice question testing knowledge of '{topic.name}'.\n"
+                f"Context: {(topic.content or '')[:2000]}\n\n"
+                "Requirements:\n"
+                "- Provide 4 informative, full-sentence or full-phrase answer choices (DO NOT use single letters like 'A', 'B', 'C', 'D' as the option text).\n"
+                "- 'correct_answer' must match the EXACT text of one of the options.\n\n"
+                "Return ONLY a JSON object:\n"
+                "{\n"
+                '  "question": "What is ...?",\n'
+                '  "options": ["Complete answer choice 1", "Complete answer choice 2", "Complete answer choice 3", "Complete answer choice 4"],\n'
+                '  "correct_answer": "Complete answer choice 1",\n'
+                '  "explanation": "Why this option is correct"\n'
+                "}"
+            )
+            response = llm.invoke([HumanMessage(content=quiz_prompt)])
             content = response.content.strip()
-            if content.startswith('```json'):
-                content = content[7:]
-            if content.startswith('```'):
-                content = content[3:]
-            if content.endswith('```'):
-                content = content[:-3]
-            q_data = json.loads(content.strip())
-            first_action = AgentAction(action_type='quiz', topic_id=topic.id, topic_name=topic.name, reasoning=f'Starting with your weakest topic: {topic.name} ({topic.mastery_score:.0f}% mastery)', content={'questions': [q_data]})
+            q_data = parse_json_response(content)
+            opts = q_data.get('options', [])
+            if not opts or all(len(str(o).strip()) <= 2 for o in opts):
+                q_data['options'] = [
+                    f"Core principles of {topic.name}",
+                    f"Implementation and deployment of {topic.name} models",
+                    f"Hardware maintenance for {topic.name} systems",
+                    f"Non-computational aspects of {topic.name}"
+                ]
+                q_data['correct_answer'] = q_data['options'][1]
+            first_action = AgentAction(
+                action_type='quiz',
+                topic_id=topic.id,
+                topic_name=topic.name,
+                reasoning=f'Starting with your weakest topic: {topic.name} ({topic.mastery_score:.0f}% mastery)',
+                content={'questions': [q_data]}
+            )
         except Exception as e:
-            first_action = AgentAction(action_type='quiz', topic_id=topic.id, topic_name=topic.name, reasoning=f'Starting with {topic.name}. (Question generation had an issue: {e})', content={'questions': [{'question': f'What is {topic.name}?', 'options': [], 'correct_answer': '', 'explanation': ''}]})
-    active_sessions[session_id] = {'subject_id': req.subject_id, 'state': {}}
+            logger.warning(f"LLM quiz generation failed: {e}")
+            q_data = {
+                'question': f'What is the primary focus of {topic.name}?',
+                'options': [
+                    f"Designing, building, and deploying {topic.name} systems into production",
+                    f"Manual data entry without automation",
+                    f"Theoretical proofs without computational models",
+                    f"Traditional database backups"
+                ],
+                'correct_answer': f"Designing, building, and deploying {topic.name} systems into production",
+                'explanation': f"This represents the core engineering foundation of {topic.name}."
+            }
+            first_action = AgentAction(
+                action_type='quiz',
+                topic_id=topic.id,
+                topic_name=topic.name,
+                reasoning=f'Starting with {topic.name}.',
+                content={'questions': [q_data]}
+            )
+    active_sessions[session_id] = {'subject_id': req.subject_id, 'current_question': q_data, 'state': {}}
     return SessionResponse(session_id=session_id, subject_name=sub.name, days_until_exam=days_until, todays_topics=todays_topics, current_action=first_action)
 
 @router.post('/session/{session_id}/answer')
@@ -151,20 +197,37 @@ def submit_answer(session_id: int, req: QuizAnswerRequest, db: Session=Depends(g
     topic_id = req.topic_id
     topic = db.query(Topic).filter(Topic.id == topic_id).first() if topic_id else None
     topic_content = (topic.content or '')[:1000] if topic else ''
+
+    current_q = session.get('current_question') or {}
+    expected_answer = str(current_q.get('correct_answer') or '').strip()
+
     llm = get_llm(temperature=0.2)
-    grade_prompt = f'Grade this answer.\nQuestion: {req.question}\nStudent Answer: {req.student_answer}\nContext: {topic_content}\n\nReturn ONLY JSON: {{"is_correct": bool, "correct_answer": "...", "explanation": "...", "misconception_detected": "..." or null}}'
+    grade_prompt = (
+        f"Grade this student's quiz answer.\n\n"
+        f"Question: {req.question}\n"
+        f"Expected Correct Answer: {expected_answer}\n"
+        f"Student Answer: {req.student_answer}\n"
+        f"Context: {topic_content}\n\n"
+        f"Return ONLY valid JSON:\n"
+        f'{{"is_correct": true or false, "correct_answer": "{expected_answer}", "explanation": "clear educational explanation", "misconception_detected": "misconception text or null"}}'
+    )
     try:
         response = llm.invoke([HumanMessage(content=grade_prompt)])
         content = response.content.strip()
-        if content.startswith('```json'):
-            content = content[7:]
-        if content.startswith('```'):
-            content = content[3:]
-        if content.endswith('```'):
-            content = content[:-3]
-        grade = json.loads(content.strip())
-    except Exception:
-        grade = {'is_correct': False, 'correct_answer': 'Unable to grade', 'explanation': 'Grading error occurred', 'misconception_detected': None}
+        grade = parse_json_response(content)
+        if not grade.get('correct_answer') and expected_answer:
+            grade['correct_answer'] = expected_answer
+    except Exception as e:
+        logger.warning(f"LLM grading failed, falling back to direct comparison: {e}")
+        student_ans = str(req.student_answer or '').strip().lower()
+        exp_ans = expected_answer.lower()
+        is_corr = (student_ans == exp_ans) or (len(exp_ans) > 0 and (student_ans in exp_ans or exp_ans in student_ans))
+        grade = {
+            'is_correct': is_corr,
+            'correct_answer': expected_answer or 'Consult topic notes',
+            'explanation': 'Correct!' if is_corr else f"The correct answer is: {expected_answer or 'See topic notes'}.",
+            'misconception_detected': None
+        }
     mastery_change = 5.0 if grade.get('is_correct') else -3.0
     new_mastery = 50.0
     if topic:
@@ -172,7 +235,14 @@ def submit_answer(session_id: int, req: QuizAnswerRequest, db: Session=Depends(g
         topic.last_reviewed = datetime.utcnow()
         topic.review_count += 1
         new_mastery = topic.mastery_score
-        db.add(QuizHistory(topic_id=topic_id, question=req.question, student_answer=req.student_answer, correct_answer=grade.get('correct_answer', ''), is_correct=grade.get('is_correct', False), explanation=grade.get('explanation', '')))
+        db.add(QuizHistory(
+            topic_id=topic_id,
+            question=req.question,
+            student_answer=req.student_answer,
+            correct_answer=grade.get('correct_answer', ''),
+            is_correct=grade.get('is_correct', False),
+            explanation=grade.get('explanation', '')
+        ))
         misconception = grade.get('misconception_detected')
         if misconception and (not grade.get('is_correct')):
             existing = db.query(Misconception).filter(Misconception.topic_id == topic_id, Misconception.description == misconception).first()
@@ -181,7 +251,14 @@ def submit_answer(session_id: int, req: QuizAnswerRequest, db: Session=Depends(g
             else:
                 db.add(Misconception(topic_id=topic_id, description=misconception))
         db.commit()
-    return {'is_correct': grade.get('is_correct', False), 'correct_answer': grade.get('correct_answer', ''), 'explanation': grade.get('explanation', ''), 'misconception_detected': grade.get('misconception_detected'), 'mastery_change': mastery_change, 'new_mastery': new_mastery}
+    return {
+        'is_correct': grade.get('is_correct', False),
+        'correct_answer': grade.get('correct_answer', ''),
+        'explanation': grade.get('explanation', ''),
+        'misconception_detected': grade.get('misconception_detected'),
+        'mastery_change': mastery_change,
+        'new_mastery': new_mastery
+    }
 
 @router.get('/session/{session_id}/next')
 def get_next_action(session_id: int, db: Session=Depends(get_db)):
@@ -194,7 +271,16 @@ def get_next_action(session_id: int, db: Session=Depends(get_db)):
         return {'action': {'action_type': 'move_on', 'reasoning': 'No topics available.'}, 'session_stats': {}}
     llm = get_llm(temperature=0.5)
     try:
-        response = llm.invoke([HumanMessage(content=f"""Generate 1 MCQ question for '{topic.name}'. Context: {(topic.content or '')[:2000]}. Return JSON: {{"question": "...", "options": ["A","B","C","D"], "correct_answer": "...", "explanation": "..."}}""")])
+        next_quiz_prompt = (
+            f"Generate 1 multiple-choice question for '{topic.name}'.\n"
+            f"Context: {(topic.content or '')[:2000]}\n\n"
+            "Rules:\n"
+            "- options must contain 4 COMPLETE answer strings, NOT just letters like A/B/C/D.\n"
+            "- correct_answer must be the EXACT text of the correct option.\n\n"
+            'Return ONLY valid JSON:\n'
+            '{"question": "...", "options": ["Full answer 1", "Full answer 2", "Full answer 3", "Full answer 4"], "correct_answer": "exact text of correct option", "explanation": "why this is correct"}'
+        )
+        response = llm.invoke([HumanMessage(content=next_quiz_prompt)])
         content = response.content.strip()
         if content.startswith('```json'):
             content = content[7:]
@@ -202,9 +288,13 @@ def get_next_action(session_id: int, db: Session=Depends(get_db)):
             content = content[3:]
         if content.endswith('```'):
             content = content[:-3]
-        question_data = json.loads(content.strip())
+        question_data = parse_json_response(content)
     except Exception:
-        question_data = {'question': f'What is {topic.name}?', 'options': ['A', 'B', 'C', 'D'], 'correct_answer': 'A'}
+        question_data = {'question': f'What is the core concept of {topic.name}?', 'options': ['Option A', 'Option B', 'Option C', 'Option D'], 'correct_answer': 'Option A', 'explanation': ''}
+    opts = question_data.get('options', [])
+    if opts and all(len(str(o).strip()) <= 2 for o in opts):
+        question_data['options'] = [f'Option {o}' for o in opts]
+    session['current_question'] = question_data
     return {'action': {'action_type': 'quiz', 'topic_id': topic.id, 'topic_name': topic.name, 'reasoning': f'Quizzing on weakest topic: {topic.name} ({topic.mastery_score:.0f}% mastery)', 'content': question_data}, 'session_stats': {}}
 
 @router.get('/subjects/{subject_id}/plan', response_model=List[StudyPlanEntryResponse])
@@ -236,7 +326,9 @@ def force_replan(subject_id: int, db: Session=Depends(get_db)):
             content = content[3:]
         if content.endswith('```'):
             content = content[:-3]
-        plan_data = json.loads(content.strip())
+        plan_data = parse_json_response(content)
+        if isinstance(plan_data, dict):
+            plan_data = plan_data.get('entries', [])
     except Exception:
         plan_data = []
     db.query(StudyPlanEntry).filter(StudyPlanEntry.subject_id == subject_id, StudyPlanEntry.date >= date.today(), StudyPlanEntry.status == PlanStatus.PENDING.value).delete()
@@ -302,6 +394,6 @@ def generate_mock(subject_id: int, db: Session=Depends(get_db)):
             content = content[3:]
         if content.endswith('```'):
             content = content[:-3]
-        return json.loads(content.strip())
+        return parse_json_response(content)
     except Exception as e:
         return {'title': f'{sub.name} Mock Paper', 'subject': sub.name, 'total_marks': 0, 'duration_minutes': 60, 'questions': [], 'focus_areas': [], 'error': str(e)}

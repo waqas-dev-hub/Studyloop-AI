@@ -15,6 +15,7 @@ class AgentState(TypedDict):
     action_result: dict
     critic_passed: bool
     critic_feedback: str
+    retry_count: int
     needs_human_approval: bool
     plan_proposal: dict
     human_approved: bool
